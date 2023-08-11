@@ -1,362 +1,229 @@
-/* This Source Code Form is subject to the terms of the Mozilla Public
- * License, v. 2.0. If a copy of the MPL was not distributed with this
- * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+const A = require("async");
+const mqtt = require("mqtt");
+const debug = require("debug")("engine:mqtt");
+const { faker } = require("@faker-js/faker");
 
-'use strict';
+const _get = (object, path) => {
+  const keys = path.split(".");
+  let index = 0;
+  const length = keys.length;
+  while (object !== null && index < length) {
+    object = object[keys[index++]];
+  }
 
-const async = require('async');
-const _ = require('lodash');
-const mqtt = require('mqtt');
-const debug = require('debug')('mqtt');
-const engineUtil = require('artillery/core/lib/engine_util');
-const template = engineUtil.template;
-
-function MqttEngine(script) {
-  this.config = script.config;
-}
-
-// scenarioSpec => All scenario spec, ee => EventEmitter
-MqttEngine.prototype.createScenario = function(scenarioSpec, ee) {
-  const self = this;
-
-  // rs => Request spec
-  let tasks = _.map(scenarioSpec.flow, function(rs) {
-    if (rs.think) {
-      return engineUtil.createThink(rs, _.get(self.config, 'defaults.think', {}));
-    }
-    return self.step(rs, ee);
-  });
-
-  return self.compile(tasks, scenarioSpec.flow, ee);
+  return index && index == length ? object : undefined;
 };
 
-function markEndTime(ee, context, startedAt) {
-  let endedAt = process.hrtime(startedAt);
-  let delta = (endedAt[0] * 1e9) + endedAt[1];
-  ee.emit('response', delta, 0, context._uid);
-}
+class MqttEngine {
+  // Artillery initializes each engine with the following arguments:
+  //
+  // - script is the entire script object, with .config and .scenarios properties
+  // - events is an EventEmitter we can use to subscribe to events from Artillery, and
+  //   to report custom metrics
+  // - helpers is a collection of utility functions
+  constructor(script, ee, helpers) {
+    this.script = script;
+    this.ee = ee;
+    this.helpers = helpers;
+    this.config = script.config.mqtt ?? {};
+    this.target = script.config.target;
 
-function isAcknowledgeRequired (spec) {
-  return (spec.rpc && spec.acknowledge);
-}
-
-function isResponseRequired(spec) {
-  return (spec.rpc && spec.response);
-}
-
-// RPC based on request id
-MqttEngine.prototype.__handleResponse = function (topic, message, packet) {
-  // Eko will return in form
-  // 41|{ id: 1, p: [err, [response]]}
-  try {
-    const i = msg.indexOf('|');
-    if (i != -1) {
-      const responderId = msg.substr(0, i);
-      const content = msg.substr(i + 1);
-
-      if (responderId == '41') {
-        const json = JSON.parse(content);
-        const data = this.responseHandlers[json.id];
-        if (data) {
-          data.executed = true;
-          data.callback(json.p[1]);
-        }
+    // Convert node template to artillery template
+    if (this.config.auth) {
+      for (const key in this.config.auth) {
+        const value = this.config.auth[key] ?? "";
+        this.config.auth[key] = value.replace(
+          /\$\{(?=[^\}]+\})([^\}]+)\}/g,
+          `{{ $1 }}`
+        );
       }
     }
-  }
-  catch (error) {
-    console.error('ERROR parsing web socket message', error);
-  }
-}
 
-// ee => EventEmitter
-// data => Received message from server
-// response => Acknowledge spec as
-//  {
-//    data: template(requestSpec.acknowledge.data, context),
-//    capture: template(requestSpec.acknowledge.capture, context),
-//    match: template(requestSpec.acknowledge.match, context)
-//  }
-function processResponse(ee, data, response, context, callback) {
-  // Do we have supplied data to validate?
-  if (response.data && !deepEqual(data, response.data)) {
-    debug(data);
-    let err = 'data is not valid';
-    ee.emit('error', err);
-    return callback(err, context);
+    return this;
   }
 
-  // If no capture or match specified, then we consider it a success at this point...
-  if (!response.capture && !response.match) {
-    return callback(null, context);
-  }
+  // For each scenario in the script using this engine, Artillery calls this function
+  // to create a VU function
+  createScenario(scenarioSpec, ee) {
+    const self = this;
+    const tasks = scenarioSpec.flow.map((rs) => this.step(rs, ee));
 
-  // Construct the (HTTP) response...
-  let fauxResponse = {body: JSON.stringify(data)};
+    return function scenario(initialContext, callback) {
+      ee.emit("started");
 
-  // Handle the capture or match clauses...
-  engineUtil.captureOrMatch(response, fauxResponse, context, function(err, result) {
-    // Were we unable to invoke captureOrMatch?
-    if (err) {
-      debug(data);
-      ee.emit('error', err);
-      return callback(err, context);
-    }
-    // Do we have any failed matches?
-    let failedMatches = _.filter(result.matches, (v, k) => {
-      return !v.success;
-    });
-
-    // How to handle failed matches?
-    if (failedMatches.length > 0) {
-      debug(failedMatches);
-      // TODO: Should log the details of the match somewhere
-      ee.emit('error', 'Failed match');
-      return callback(new Error('Failed match'), context);
-    } else {
-      // Emit match events...
-      _.each(result.matches, function(v, k) {
-        ee.emit('match', v.success, {
-          expected: v.expected,
-          got: v.got,
-          expression: v.expression
+      function vuInit(callback) {
+        // We can run custom VU-specific init code here
+        const parsedAuth = self.helpers.template(
+          self.config.auth,
+          initialContext
+        );
+        const { auth, ...rest } = self.config;
+        debug("mqtt is connecting as", parsedAuth.clientId);
+        const mqttClient = mqtt.connect(self.target, {
+          ...rest,
+          ...parsedAuth,
         });
-      });
 
-      // Populate the context with captured values
-      _.each(result.captures, function(v, k) {
-        context.vars[k] = v;
-      });
+        mqttClient.once("connect", () => {
+          debug("mqtt is connected");
+          initialContext.mqtt = mqttClient;
 
-      // Replace the base object context
-      // Question: Should this be JSON object or String?
-      context.vars.$ = fauxResponse.body;
+          ee.emit("counter", "mqtt.connect", 1);
+          return callback(null, initialContext);
+        });
 
-      // Increment the success count...
-      context._successCount++;
+        // Throw error fast if connection is failed
+        mqttClient.once("error", (error) => {
+          debug("mqtt error", error);
+          return callback(error);
+        });
 
-      return callback(null, context);
-    }
-  });
-}
-
-MqttEngine.prototype.step = function (requestSpec, ee) {
-  let self = this;
-
-  if (requestSpec.loop) {
-    let steps = _.map(requestSpec.loop, function(rs) {
-      return self.step(rs, ee);
-    });
-
-    return engineUtil.createLoopWithCount(
-      requestSpec.count || -1,
-      steps,
-      {
-        loopValue: requestSpec.loopValue || '$loopCount',
-        overValues: requestSpec.over,
-        whileTrue: self.config.processor ?
-          self.config.processor[requestSpec.whileTrue] : undefined
-      });
-  }
-
-  if (requestSpec.think) {
-    return engineUtil.createThink(requestSpec, _.get(self.config, 'defaults.think', {}));
-  }
-
-  if (requestSpec.log) {
-    return function(context, callback) {
-      console.log(template(requestSpec.log, context));
-      return process.nextTick(function() { callback(null, context); });
-    };
-  }
-
-  if (requestSpec.close) {
-    return function(context, callback) {
-      if (context && context.ws) {
-        context.ws.close();
+        // Capture on going events
+        mqttClient
+          .on("error", (error) => {
+            debug("mqtt error", error);
+            ee.emit("error", error.message || error.code);
+          })
+          .on("reconnect", () => {
+            debug("mqtt is reconnecting");
+            ee.emit(
+              "counter",
+              `mqtt.reconnect.${mqttClient.options.clientId}`,
+              1
+            );
+          });
       }
-      return callback(null, context);
+
+      const steps = [vuInit].concat(tasks);
+
+      A.waterfall(steps, function done(error, context) {
+        if (error) {
+          debug("request spec end error", error);
+          return callback(error, context);
+        }
+
+        if (context && context.mqtt) {
+          debug("mqtt is ending");
+          context.mqtt.end((error) => {
+            if (error) {
+              ee.emit("counter", "mqtt.error.close", 1);
+            } else {
+              ee.emit("counter", "mqtt.close", 1);
+            }
+
+            return callback(error, context);
+          });
+        } else {
+          return callback(error, context);
+        }
+      });
     };
   }
 
-  if (requestSpec.function) {
-    return function(context, callback) {
-      let processFunc = self.config.processor[requestSpec.function];
-      if (processFunc) {
-        processFunc(context, ee, function () {
+  // This is a convenience function where we delegate common actions like loop, log, and think,
+  // and handle actions which are custom for our engine, i.e. the "doSomething" action in this case
+  step(rs, ee) {
+    const self = this;
+
+    if (rs.loop) {
+      const steps = rs.loop.map((loopStep) => this.step(loopStep, ee));
+
+      return this.helpers.createLoopWithCount(rs.count || -1, steps, {
+        loopValue: rs.loopValue || "$loopCount",
+        overValues: rs.over,
+        whileTrue: self.config.processor
+          ? self.config.processor[rs.whileTrue]
+          : undefined,
+      });
+    }
+
+    if (rs.log) {
+      return function log(context, callback) {
+        console.log(chalk.blue(self.helpers.template(rs.log, context)));
+        return process.nextTick(function () {
+          callback(null, context);
+        });
+      };
+    }
+
+    if (rs.think) {
+      return this.helpers.createThink(rs, self.config?.defaults?.think || {});
+    }
+
+    if (rs.function) {
+      return function (context, callback) {
+        let func = self.script.config.processor[rs.function];
+        if (!func) {
+          return process.nextTick(function () {
+            callback(null, context);
+          });
+        }
+
+        return func(context, ee, function () {
           return callback(null, context);
         });
-      }
-    }
-  }
-
-  const f = function(context, callback) {
-    ee.emit('request');
-    const startedAt = process.hrtime();
-    const ws = context.ws || null;
-    const uniqueId = _.uniqueId();
-
-    let params = [];
-    if (requestSpec.params) {
-      params = _.map(_.values(requestSpec.params), v => {
-        return template(v, context);
-      });
-    }
-    const payload = template(`41|{"id":${uniqueId},"m":"${requestSpec.rpc}","p":${JSON.stringify(params)}}`, context);
-
-    const endCallback = function (err, context, needEmit) {
-      if (err) {
-        debug(err);
-      }
-
-      if (isAcknowledgeRequired(requestSpec)) {
-        let ackCallback = function () {
-          let response = {
-            data: template(requestSpec.acknowledge.data, context),
-            capture: template(requestSpec.acknowledge.capture, context),
-            match: template(requestSpec.acknowledge.match, context)
-          };
-          // Make sure data, capture or match has a default json spec for parsing socket responses
-          _.each(response, function (r) {
-            if (_.isPlainObject(r) && !('json' in r)) {
-              r.json = '$.0'; // Default to the first callback argument
-            }
-          });
-          // Acknowledge data can take up multiple arguments of the emit callback
-          processResponse(ee, arguments, response, context, function (err) {
-            if (!err) {
-              markEndTime(ee, context, startedAt);
-            }
-            return callback(err, context);
-          });
-        }
-
-        // Acknowledge required so add callback to responseHandlers
-        self.responseHandlers[uniqueId] = {
-          callback: ackCallback,
-          executed: false,
-          rpc: requestSpec.rpc,
-        }
-        setTimeout(() => {
-          const data = self.responseHandlers[uniqueId];
-          const err = `response timeout for ${data.rpc}`;
-          if (data && !data.executed) {
-            // PUD::Must delete here because return use `return callback` and it will stop there
-            delete self.responseHandlers[uniqueId];
-
-            ee.emit('error', err);
-            return callback(new Error(err), context);
-          }
-
-          delete self.responseHandlers[uniqueId];
-        }, self.timeout);
-        ws.send(payload);
-      } else {
-        // No acknowledge data is expected, so just send without register callback
-        ws.send(payload);
-        markEndTime(ee, context, startedAt);
-        return callback(null, context);
-      }
-    };
-
-    endCallback(null, context, true);
-
-    // PUD:: This is for socketio to listen on the different channel for response
-    /*
-    if (isResponseRequired(requestSpec)) {
-      let response = {
-        channel: template(requestSpec.emit.response.channel, context),
-        data: template(requestSpec.emit.response.data, context),
-        capture: template(requestSpec.emit.response.capture, context),
-        match: template(requestSpec.emit.response.match, context)
       };
-      // Listen for the socket.io response on the specified channel
-      let done = false;
-      socketio.on(response.channel, function receive(data) {
-        done = true;
-        processResponse(ee, data, response, context, function(err) {
-          if (!err) {
-            markEndTime(ee, context, startedAt);
+    }
+
+    //
+    // This is our custom action:
+    //
+    // TODO::PUD implement publish function
+    if (rs.publish) {
+      return function publish(context, callback) {
+        const topic = self.helpers.template(rs.publish.topic, context);
+        const payload = self.helpers.template(rs.publish.payload, context);
+
+        debug("publish topic", topic);
+        debug("publish payload", payload);
+        context.mqtt.publish(
+          topic,
+          typeof payload === "string" ? payload : JSON.stringify(payload),
+          rs.publish.options,
+          (error) => {
+            if (error) {
+              ee.emit("error", error.message || error.code);
+              return callback(error);
+            }
+
+            ee.emit("counter", "mqtt.publish_count", 1);
+            ee.emit("rate", "mqtt.publish_rate");
+            return callback(null, context);
           }
-          // Stop listening on the response channel
-          socketio.off(response.channel);
-          return endCallback(err, context, false);
-        });
-      });
-      // Send the data on the specified socket.io channel
-      socketio.emit(outgoing.channel, outgoing.data);
-      // If we don't get a response within the timeout, fire an error
-      let waitTime = self.config.timeout || 10;
-      waitTime *= 1000;
-      setTimeout(function responseTimeout() {
-        if (!done) {
-          let err = 'response timeout';
-          ee.emit('error', err);
-          return callback(err, context);
-        }
-      }, waitTime);
-    } else {
-      endCallback(null, context, true);
-    }
-    */
-  };
-
-  return f;
-};
-
-MqttEngine.prototype.compile = function (tasks, scenarioSpec, ee) {
-  const config = this.config;
-  this.responseHandlers = {};
-
-  const self = this;
-
-  return function scenario(initialContext, callback) {
-    const createMqttClient = function (config, callback) {
-      const client = mqtt.connect(config.target);
-
-      client.on('connect', function() {
-        initialContext.client = client;
-        return callback(null, initialContext);
-      });
-
-      client.on('message', function(topic, message, packet) {
-        self.__handleResponse(topic, message, packet);
-      });
-
-      client.once('error', function(err) {
-        debug(err);
-        ee.emit('error', err.message || err.code);
-        return callback(err, {});
-      });
+        );
+      };
     }
 
-    function zero(callback) {
-      ee.emit('started');
+    if (rs.faker) {
+      return function (context, callback) {
+        const name = rs.faker.name;
+        const args = rs.faker.parameters;
+        const variable = rs.faker.store;
 
-      createMqttClient(config, callback);
+        // TONOTE:: Hack using timestamp
+        if (name === "timestamp") {
+          context.vars[variable] = Date.now();
+          return callback(null, context);
+        } else {
+          const func = _get(faker, name);
+          if (!func) {
+            return process.nextTick(function () {
+              callback(null, context);
+            });
+          }
+          context.vars[variable] = args ? func.call(func, ...args) : func();
+          return callback(null, context);
+        }
+      };
     }
 
-    initialContext._successCount = 0;
-
-    let steps = _.flatten([
-      zero,
-      tasks
-    ]);
-
-    async.waterfall(
-      steps,
-      function scenarioWaterfallCb(err, context) {
-        if (err) {
-          debug(err);
-        }
-
-        if (context && context.client) {
-          context.client.end();
-        }
-
-        return callback(err, context);
-      });
-  };
-};
+    //
+    // Ignore any unrecognized actions:
+    //
+    return function doNothing(context, callback) {
+      return callback(null, context);
+    };
+  }
+}
 
 module.exports = MqttEngine;

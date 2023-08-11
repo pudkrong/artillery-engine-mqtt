@@ -1,17 +1,43 @@
 {
   "name": "artillery-engine-mqtt",
-  "version": "1.0.0",
-  "description": "",
+  "version": "0.0.0-development",
+  "description": "MQTT engine for Artillery",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 0"
   },
-  "author": "",
-  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pudkrong/artillery-engine-mqtt.git"
+  },
+  "release": {
+    "branches": [
+      "main"
+    ],
+    "remoteTags": true,
+    "plugins": [
+      "@semantic-release/commit-analyzer",
+      "@semantic-release/release-notes-generator",
+      [
+        "@semantic-release/github",
+        {
+          "successComment": false,
+          "failTitle": false
+        }
+      ]
+    ]
+  },
+  "keywords": [
+    "artillery",
+    "loadtest",
+    "engine",
+    "mqtt"
+  ],
+  "author": "Pisut Sritrakulchai",
+  "license": "MPL-2.0",
   "dependencies": {
-    "artillery": "^1.6.0-28",
-    "async": "^3.1.0",
-    "lodash": "^4.17.15",
-    "mqtt": "^3.0.0"
+    "@faker-js/faker": "8.0.2",
+    "artillery": "2.0.0-35",
+    "mqtt": "5.0.2"
   }
 }
