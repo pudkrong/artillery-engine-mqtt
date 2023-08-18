@@ -1,6 +1,6 @@
 {
   "name": "artillery-engine-mqtt",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "MQTT engine for Artillery",
   "main": "index.js",
   "scripts": {
