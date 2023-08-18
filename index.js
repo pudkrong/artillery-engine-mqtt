@@ -168,8 +168,8 @@ class MqttEngine {
       return this.helpers.createLoopWithCount(rs.count || -1, steps, {
         loopValue: rs.loopValue || "$loopCount",
         overValues: rs.over,
-        whileTrue: self.config.processor
-          ? self.config.processor[rs.whileTrue]
+        whileTrue: self.script.config.processor
+          ? self.script.config.processor[rs.whileTrue]
           : undefined,
       });
     }
