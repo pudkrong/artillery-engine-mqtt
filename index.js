@@ -105,13 +105,8 @@ class MqttEngine {
           initialContext.mqtt = mqttClient;
 
           ee.emit("counter", "mqtt.connect", 1);
+          ee.emit("rate", "mqtt.connect");
           return callback(null, initialContext);
-        });
-
-        // Throw error fast if connection is failed
-        mqttClient.once("error", (error) => {
-          debug("mqtt error", error);
-          return callback(error);
         });
 
         // Capture on going events
@@ -119,6 +114,7 @@ class MqttEngine {
           .on("error", (error) => {
             debug("mqtt error", error);
             ee.emit("error", error.message || error.code);
+            ee.emit("rate", "mqtt.error_rate");
           })
           .on("reconnect", () => {
             debug("mqtt is reconnecting");
