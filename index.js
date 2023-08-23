@@ -105,7 +105,7 @@ class MqttEngine {
           initialContext.mqtt = mqttClient;
 
           ee.emit("counter", "mqtt.connect", 1);
-          ee.emit("rate", "mqtt.connect");
+          ee.emit("rate", "mqtt.connect_rate");
           return callback(null, initialContext);
         });
 
